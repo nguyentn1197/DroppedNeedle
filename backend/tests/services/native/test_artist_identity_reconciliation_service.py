@@ -1798,3 +1798,367 @@ async def test_album_reenqueue_after_terminal_state_creates_fresh_job(
             "SELECT COUNT(*) FROM library_operation_jobs WHERE kind = 'repair'"
         ).fetchone()[0]
     assert count == 2
+
+
+# --- Embedded artist MBIDs anchor a differently named local artist ---------
+#
+# Files tagged with a translated/romanized artist name (e.g. "Otonose Kanade")
+# plus MUSICBRAINZ_ARTISTID of an artist whose MusicBrainz name is in another
+# script ("音乃瀬奏") used to split into two local artists: the projection only
+# matched local artists by name, so it created a new canonical-named artist and
+# the tag-named one stayed local-only while any of its albums was unidentified.
+
+ROMANIZED = "Otonose Kanade"
+CANONICAL = "音乃瀬奏"
+
+
+def _romanized_artist(
+    artist_id: str = "artist-oto", name: str = ROMANIZED
+) -> LocalArtist:
+    return LocalArtist(
+        id=artist_id,
+        display_name=name,
+        folded_name=name.casefold(),
+        normalized_name=name.casefold(),
+        kind="group",
+        created_at=1,
+        updated_at=1,
+    )
+
+
+def _album_for(
+    artist: LocalArtist,
+    suffix: str,
+    *,
+    embedded_mbid: str | None,
+    include_artist: bool,
+) -> CatalogMembership:
+    album = LocalAlbum(
+        id=f"album-{suffix}",
+        root_id="root-1",
+        grouping_key=f"group-{suffix}",
+        title="Release",
+        album_artist_id=artist.id,
+        album_artist_name=artist.display_name,
+        created_at=1,
+        updated_at=1,
+    )
+    track = LocalTrack(
+        id=f"track-{suffix}",
+        local_album_id=album.id,
+        root_id="root-1",
+        file_path=f"/music/{suffix}.flac",
+        relative_path=f"{suffix}.flac",
+        path_hash=f"hash-{suffix}",
+        file_size_bytes=100,
+        file_mtime_ns=200,
+        stat_revision=f"stat-{suffix}",
+        tag_revision=f"tag-{suffix}",
+        title="Track",
+        artist_name=artist.display_name,
+        album_title="Release",
+        album_artist_name=artist.display_name,
+        embedded_artist_mbid=embedded_mbid,
+        embedded_album_artist_mbid=embedded_mbid,
+        file_format="flac",
+        imported_at=1,
+        applied_policy="automatic",
+    )
+    credit = LocalArtistCredit(
+        local_artist_id=artist.id, position=0, credited_name=artist.display_name
+    )
+    return CatalogMembership(
+        album=album,
+        artists=[artist] if include_artist else [],
+        tracks=[track],
+        album_credits=[credit],
+        track_credits={track.id: [credit]},
+    )
+
+
+async def _seed_romanized_artist(
+    store: NativeLibraryStore,
+    *,
+    embedded: tuple[str | None, str | None] = (ARTIST_MBID, ARTIST_MBID),
+) -> LocalArtist:
+    """One tag-named artist on two albums ("oto1", "oto2"), embedded MBIDs as given."""
+    artist = _romanized_artist()
+    await store.create_catalog_membership(
+        _album_for(artist, "oto1", embedded_mbid=embedded[0], include_artist=True)
+    )
+    await store.create_catalog_membership(
+        _album_for(artist, "oto2", embedded_mbid=embedded[1], include_artist=False)
+    )
+    return artist
+
+
+async def _seed_linked_canonical_artist(store: NativeLibraryStore) -> str:
+    canonical = _romanized_artist("artist-jp", CANONICAL)
+    await store.create_catalog_membership(
+        _album_for(canonical, "jp", embedded_mbid=ARTIST_MBID, include_artist=True)
+    )
+    await store.attach_artist_identity_with_aliases(
+        LocalArtistExternalIdentity(
+            local_artist_id=canonical.id,
+            provider_artist_id=ARTIST_MBID,
+            decision_source="automatic",
+            selected_at=2,
+        ),
+        [],
+        expected_artist_revision=1,
+    )
+    return canonical.id
+
+
+def _artist_rows(db_path: Path) -> dict[str, tuple[str, str | None, str | None]]:
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            "SELECT artist.id, artist.display_name, artist.retired_into_artist_id, "
+            "identity.provider_artist_id FROM local_artists artist "
+            "LEFT JOIN local_artist_external_identities identity "
+            "ON identity.local_artist_id = artist.id AND identity.provider = 'musicbrainz'"
+        ).fetchall()
+    return {row[0]: (row[1], row[2], row[3]) for row in rows}
+
+
+@pytest.mark.asyncio
+async def test_embedded_mbid_keeps_romanized_artist_when_release_names_it_differently(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_romanized_artist(store)
+    await _accept_exact_identity(store, "oto1")
+    provider = AsyncMock()
+    provider.get_canonical_release.return_value = _release(artist_name=CANONICAL)
+    service = ArtistIdentityReconciliationService(store, provider, clock=lambda: 3)
+
+    await _run_album(service, store, "album-oto1")
+
+    rows = _artist_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        decision = connection.execute(
+            "SELECT decision_source FROM local_artist_external_identities "
+            "WHERE provider_artist_id = ?",
+            (ARTIST_MBID,),
+        ).fetchone()[0]
+        album_credits = dict(
+            connection.execute(
+                "SELECT local_album_id, local_artist_id FROM local_album_artists"
+            ).fetchall()
+        )
+        credited_name = connection.execute(
+            "SELECT credited_name FROM local_album_artists WHERE local_album_id = 'album-oto1'"
+        ).fetchone()[0]
+    # The tag-named artist now owns the MBID; no second artist was created.
+    assert rows["artist-oto"] == (ROMANIZED, None, ARTIST_MBID)
+    assert decision == "embedded"
+    assert [row for row in rows.values() if row[0] == CANONICAL] == []
+    # Both albums stay on the one artist; the release's credit text is kept.
+    assert album_credits == {"album-oto1": "artist-oto", "album-oto2": "artist-oto"}
+    assert credited_name == CANONICAL
+
+
+@pytest.mark.asyncio
+async def test_embedded_mbid_retires_romanized_split_into_existing_provider_artist(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    canonical_id = await _seed_linked_canonical_artist(store)
+    await _seed_romanized_artist(store)
+    service = ArtistIdentityReconciliationService(store, AsyncMock(), clock=lambda: 3)
+
+    await _run_album(service, store, "album-oto2")  # unidentified album
+
+    rows = _artist_rows(db_path)
+    with sqlite3.connect(db_path) as connection:
+        album_credits = dict(
+            connection.execute(
+                "SELECT local_album_id, local_artist_id FROM local_album_artists"
+            ).fetchall()
+        )
+        reasons = [
+            row[0]
+            for row in connection.execute(
+                "SELECT reason_code FROM library_catalog_actions"
+            ).fetchall()
+        ]
+    assert rows["artist-oto"][1] == canonical_id
+    assert rows[canonical_id] == (CANONICAL, None, ARTIST_MBID)
+    assert album_credits == {
+        "album-jp": canonical_id,
+        "album-oto1": canonical_id,
+        "album-oto2": canonical_id,
+    }
+    assert reasons == ["AUTOMATIC_EMBEDDED_ARTIST_IDENTITY_CONVERGENCE"]
+    assert connection_state(db_path, "album-oto2") == (
+        "resolved_automatically",
+        "PROVIDER_ANCHORED_ARTISTS_CONVERGED",
+    )
+    # The Artist Identity Desk lists the heal and counts it as automatic.
+    listing = await service.list_groups(
+        limit=50, cursor=None, state="resolved_automatically", search=None
+    )
+    progress = await service.progress()
+    assert listing.total == 1
+    assert (
+        listing.items[0].reason_code == "AUTOMATIC_EMBEDDED_ARTIST_IDENTITY_CONVERGENCE"
+    )
+    assert progress.automatically_resolved_count == 1
+
+
+@pytest.mark.asyncio
+async def test_disagreeing_embedded_mbids_never_anchor_or_retire_the_artist(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    canonical_id = await _seed_linked_canonical_artist(store)
+    await _seed_romanized_artist(store, embedded=(ARTIST_MBID, OTHER_ARTIST_MBID))
+    service = ArtistIdentityReconciliationService(store, AsyncMock(), clock=lambda: 3)
+
+    await _run_album(service, store, "album-oto2")
+
+    rows = _artist_rows(db_path)
+    assert rows["artist-oto"] == (ROMANIZED, None, None)
+    assert rows[canonical_id] == (CANONICAL, None, ARTIST_MBID)
+
+
+@pytest.mark.asyncio
+async def test_disagreeing_embedded_mbids_keep_name_only_projection_behaviour(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    await _seed_romanized_artist(store, embedded=(ARTIST_MBID, OTHER_ARTIST_MBID))
+    await _accept_exact_identity(store, "oto1")
+    provider = AsyncMock()
+    provider.get_canonical_release.return_value = _release(artist_name=CANONICAL)
+    service = ArtistIdentityReconciliationService(store, provider, clock=lambda: 3)
+
+    await _run_album(service, store, "album-oto1")
+
+    rows = _artist_rows(db_path)
+    owners = [artist_id for artist_id, row in rows.items() if row[2] == ARTIST_MBID]
+    assert rows["artist-oto"] == (ROMANIZED, None, None)
+    assert len(owners) == 1 and owners[0] != "artist-oto"
+    assert rows[owners[0]][0] == CANONICAL
+
+
+@pytest.mark.asyncio
+async def test_dismissed_pair_blocks_embedded_anchor_convergence(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    canonical_id = await _seed_linked_canonical_artist(store)
+    await _seed_romanized_artist(store)
+    with sqlite3.connect(db_path) as connection:
+        revisions = dict(
+            connection.execute(
+                "SELECT id, row_revision FROM local_artists WHERE id IN (?, 'artist-oto')",
+                (canonical_id,),
+            ).fetchall()
+        )
+    await store.dismiss_artist_duplicate_group(
+        artist_ids=[canonical_id, "artist-oto"],
+        expected_revisions=revisions,
+        actor_user_id="admin",
+        now=3,
+    )
+    service = ArtistIdentityReconciliationService(store, AsyncMock(), clock=lambda: 3)
+
+    await _run_album(service, store, "album-oto2")
+
+    assert _artist_rows(db_path)["artist-oto"] == (ROMANIZED, None, None)
+
+
+@pytest.mark.asyncio
+async def test_startup_backfill_heals_an_existing_romanized_split_without_provider_calls(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    canonical_id = await _seed_linked_canonical_artist(store)
+    await _seed_romanized_artist(store)
+    provider = AsyncMock()
+    service = ArtistIdentityReconciliationService(store, provider, clock=lambda: 3)
+
+    await service.enqueue_backfill()
+    claimed = await store.claim_operation_job(
+        "worker", now=3, lease_seconds=60, kind="repair"
+    )
+    assert claimed is not None
+    finished = await service.run_claimed(claimed, "worker")
+
+    rows = _artist_rows(db_path)
+    assert finished["state"] == "succeeded"
+    assert rows["artist-oto"][1] == canonical_id
+    assert rows[canonical_id] == (CANONICAL, None, ARTIST_MBID)
+    provider.get_canonical_release.assert_not_called()
+
+
+def _credit_state(db_path: Path, album_id: str) -> tuple[str, int, str]:
+    """(reconciliation reason, stored credit proofs, album credit text) for an album."""
+    with sqlite3.connect(db_path) as connection:
+        reason = connection.execute(
+            "SELECT reason_code FROM library_artist_reconciliation_state "
+            "WHERE local_album_id = ?",
+            (album_id,),
+        ).fetchone()[0]
+        proofs = connection.execute(
+            "SELECT COUNT(*) FROM library_artist_credit_proofs "
+            "WHERE local_album_id = ?",
+            (album_id,),
+        ).fetchone()[0]
+        credited_name = connection.execute(
+            "SELECT credited_name FROM local_album_artists WHERE local_album_id = ?",
+            (album_id,),
+        ).fetchone()[0]
+    return reason, proofs, credited_name
+
+
+@pytest.mark.asyncio
+async def test_embedded_heal_of_identified_album_artist_still_projects_the_album(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    # Retiring the album artist bumps the album revision. The projection that
+    # follows in the same run must still be valid, not fail as STALE_INPUT.
+    canonical_id = await _seed_linked_canonical_artist(store)
+    await _seed_romanized_artist(store)
+    await _accept_exact_identity(store, "oto1")
+    provider = AsyncMock()
+    provider.get_canonical_release.return_value = _release(artist_name=CANONICAL)
+    service = ArtistIdentityReconciliationService(store, provider, clock=lambda: 3)
+
+    await _run_album(service, store, "album-oto1")
+
+    reason, proofs, credited_name = _credit_state(db_path, "album-oto1")
+    assert reason != "STALE_INPUT"
+    assert proofs > 0
+    assert credited_name == CANONICAL
+    rows = _artist_rows(db_path)
+    assert rows["artist-oto"][1] == canonical_id
+    assert rows[canonical_id] == (CANONICAL, None, ARTIST_MBID)
+
+
+@pytest.mark.asyncio
+async def test_embedded_heal_in_a_sweep_does_not_stale_a_later_identified_album(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    # "album-aaa" (unidentified) sorts first, so its heal retires the artist that
+    # is also the album artist of the not-yet-projected "album-zzz".
+    canonical_id = await _seed_linked_canonical_artist(store)
+    artist = _romanized_artist()
+    await store.create_catalog_membership(
+        _album_for(artist, "aaa", embedded_mbid=ARTIST_MBID, include_artist=True)
+    )
+    await store.create_catalog_membership(
+        _album_for(artist, "zzz", embedded_mbid=ARTIST_MBID, include_artist=False)
+    )
+    await _accept_exact_identity(store, "zzz")
+    provider = AsyncMock()
+    provider.get_canonical_release.return_value = _release(artist_name=CANONICAL)
+    service = ArtistIdentityReconciliationService(store, provider, clock=lambda: 3)
+
+    await service.enqueue_backfill()
+    claimed = await store.claim_operation_job(
+        "worker", now=3, lease_seconds=60, kind="repair"
+    )
+    assert claimed is not None
+    await service.run_claimed(claimed, "worker")
+
+    reason, proofs, credited_name = _credit_state(db_path, "album-zzz")
+    assert reason != "STALE_INPUT"
+    assert proofs > 0
+    assert credited_name == CANONICAL
+    assert _artist_rows(db_path)["artist-oto"][1] == canonical_id

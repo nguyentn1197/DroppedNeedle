@@ -53,7 +53,10 @@ from services.native.wal_checkpoint_service import WalCheckpointService
 
 ARTIST_RECONCILIATION_PURPOSE = "artist_identity_reconciliation"
 ARTIST_RECONCILIATION_VERSION = "musicbrainz-artist-credit-v3"
-_BACKFILL_IDEMPOTENCY_KEY = "artist-identity-reconciliation:v3:backfill"
+# v4: one more startup sweep so embedded-MBID convergence heals artists that
+# earlier versions split by tag name. The projection version is unchanged, so
+# albums with unchanged provider evidence still skip the MusicBrainz fetch.
+_BACKFILL_IDEMPOTENCY_KEY = "artist-identity-reconciliation:v4:backfill"
 # Provider-deferred work must not be retried immediately: the defer re-queues the
 # job, and without a not-before the operation worker instantly re-claims the same
 # item and hot-spins against an open circuit breaker. 120 s gives the shared
@@ -436,8 +439,27 @@ class ArtistIdentityReconciliationService:
                     operation_job_id=job_id,
                     now=now,
                 )
-                if anchored["retired_artist_ids"] and self._on_catalog_changed is not None:
-                    await self._on_catalog_changed()
+                if anchored["retired_artist_ids"]:
+                    if self._on_catalog_changed is not None:
+                        await self._on_catalog_changed()
+                    # Healing an album artist moves the album revision; project
+                    # from the current rows, not the pre-heal snapshot.
+                    context = await self._store.get_artist_reconciliation_context(
+                        album_id
+                    )
+                    if context is None or context["identity"] is None:
+                        await self._store.complete_artist_reconciliation_work(
+                            job_id=job_id,
+                            ordinal=int(work["ordinal"]),
+                            worker_id=worker_id,
+                            local_album_id=album_id,
+                            input_revision=revision,
+                            result_state="waiting_for_identity",
+                            reason_code="STALE_INPUT",
+                            now=now,
+                            skipped=True,
+                        )
+                        continue
                 previous = context["state"]
                 if (
                     previous is not None

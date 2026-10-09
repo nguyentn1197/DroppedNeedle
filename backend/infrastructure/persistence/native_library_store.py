@@ -16240,6 +16240,90 @@ class NativeLibraryStore(PersistenceBase):
 
         return await self._read(operation)
 
+    @staticmethod
+    def _embedded_artist_mbids_tx(
+        connection: sqlite3.Connection, local_artist_id: str
+    ) -> set[str]:
+        """Every artist MBID the artist's own files embed for its credits.
+
+        Position-0 album credits read each indexed track's
+        ``embedded_album_artist_mbid``; position-0 track credits read
+        ``embedded_artist_mbid``. Later credit positions have no per-position
+        embedded value in the catalog, so they contribute nothing. Values are
+        trimmed and lowercased; an invalid value is kept so it disqualifies the
+        artist instead of being silently ignored."""
+        rows = connection.execute(
+            "SELECT lower(trim(track.embedded_album_artist_mbid)) mbid "
+            "FROM local_album_artists credit "
+            "JOIN local_albums album ON album.id = credit.local_album_id "
+            "JOIN local_tracks track ON track.local_album_id = album.id "
+            "WHERE credit.local_artist_id = ? AND credit.position = 0 "
+            "AND album.retired_into_album_id IS NULL "
+            "AND track.availability = 'indexed' "
+            "AND trim(COALESCE(track.embedded_album_artist_mbid, '')) != '' "
+            "UNION "
+            "SELECT lower(trim(track.embedded_artist_mbid)) mbid "
+            "FROM local_track_artists credit "
+            "JOIN local_tracks track ON track.id = credit.local_track_id "
+            "JOIN local_albums album ON album.id = track.local_album_id "
+            "WHERE credit.local_artist_id = ? AND credit.position = 0 "
+            "AND album.retired_into_album_id IS NULL "
+            "AND track.availability = 'indexed' "
+            "AND trim(COALESCE(track.embedded_artist_mbid, '')) != ''",
+            (local_artist_id, local_artist_id),
+        ).fetchall()
+        return {str(row["mbid"]) for row in rows}
+
+    @classmethod
+    def _embedded_artist_anchor_tx(
+        cls,
+        connection: sqlite3.Connection,
+        local_artist_id: str,
+        artist_mbid: str,
+    ) -> bool:
+        """True when the artist's own files prove it is ``artist_mbid``.
+
+        The artist must be active, must not be a reserved placeholder, must not
+        hold a different provider identity, every embedded artist MBID on its
+        credited files must be exactly ``artist_mbid`` (at least one), and no
+        stored credit proof may already map it to another MusicBrainz artist.
+        Name agreement is deliberately not required: tags written with
+        translated or romanized names (e.g. Picard locale aliases) never equal
+        the MusicBrainz canonical name."""
+        expected = (artist_mbid or "").strip().lower()
+        if not is_valid_mbid(expected) or local_artist_id in {
+            VARIOUS_ARTISTS_ID,
+            UNKNOWN_ARTIST_ID,
+        }:
+            return False
+        if (
+            connection.execute(
+                "SELECT 1 FROM local_artists WHERE id = ? "
+                "AND retired_into_artist_id IS NULL",
+                (local_artist_id,),
+            ).fetchone()
+            is None
+        ):
+            return False
+        identity = connection.execute(
+            "SELECT provider_artist_id FROM local_artist_external_identities "
+            "WHERE local_artist_id = ? AND provider = 'musicbrainz'",
+            (local_artist_id,),
+        ).fetchone()
+        if (
+            identity is not None
+            and str(identity["provider_artist_id"]).lower() != expected
+        ):
+            return False
+        if cls._embedded_artist_mbids_tx(connection, local_artist_id) != {expected}:
+            return False
+        contradicting_proof = connection.execute(
+            "SELECT 1 FROM library_artist_credit_proofs "
+            "WHERE source_local_artist_id = ? AND lower(artist_mbid) != ? LIMIT 1",
+            (local_artist_id, expected),
+        ).fetchone()
+        return contradicting_proof is None
+
     @classmethod
     def _provider_artist_for_credit_tx(
         cls,
@@ -16247,6 +16331,7 @@ class NativeLibraryStore(PersistenceBase):
         credit: ProviderArtistCredit,
         *,
         now: float,
+        source_artist_id: str | None = None,
     ) -> str:
         if not is_valid_mbid(credit.artist_mbid):
             raise ValidationError(
@@ -16277,6 +16362,15 @@ class NativeLibraryStore(PersistenceBase):
             return owner_id
 
         candidate_id: str | None = None
+        decision_source = "automatic"
+        # The artist this credit position held before projection keeps the
+        # provider identity when its own files embed exactly this MBID, even if
+        # its tag name differs from the MusicBrainz name.
+        if source_artist_id is not None and cls._embedded_artist_anchor_tx(
+            connection, source_artist_id, credit.artist_mbid
+        ):
+            candidate_id = source_artist_id
+            decision_source = "embedded"
         names = {
             value
             for value in (
@@ -16285,7 +16379,7 @@ class NativeLibraryStore(PersistenceBase):
             )
             if value
         }
-        if names:
+        if candidate_id is None and names:
             placeholders = ",".join("?" for _ in names)
             candidate = connection.execute(
                 "SELECT artist.id FROM local_artists artist "
@@ -16362,8 +16456,8 @@ class NativeLibraryStore(PersistenceBase):
         connection.execute(
             "INSERT OR IGNORE INTO local_artist_external_identities "
             "(local_artist_id, provider, provider_artist_id, decision_source, selected_at) "
-            "VALUES (?,'musicbrainz',?,'automatic',?)",
-            (candidate_id, credit.artist_mbid, now),
+            "VALUES (?,'musicbrainz',?,?,?)",
+            (candidate_id, credit.artist_mbid, decision_source, now),
         )
         owner = connection.execute(
             "SELECT local_artist_id FROM local_artist_external_identities "
@@ -16530,6 +16624,31 @@ class NativeLibraryStore(PersistenceBase):
         )
         if job_update.rowcount != 1:
             raise StaleRevisionError("The artist reconciliation job lease changed.")
+
+    @staticmethod
+    def _rebaseline_artist_reconciliation_work_tx(
+        connection: sqlite3.Connection,
+        previous_album_revisions: dict[str, int],
+        *,
+        now: float,
+    ) -> None:
+        """Keep queued reconciliation work valid across its own artist retirement.
+
+        Retiring an album artist bumps the ``row_revision`` of every album it was
+        the album artist of. Reconciliation work records that revision when the
+        worklist is materialized, and the projection rejects an album whose
+        revision moved, so the heal would strand its own pending or running work
+        as STALE_INPUT. Only rows still holding the exact pre-retire revision move;
+        work that went stale for any other reason stays stale."""
+        for album_id, previous_revision in previous_album_revisions.items():
+            connection.execute(
+                "UPDATE library_operation_work SET expected_subject_revision = "
+                "(SELECT row_revision FROM local_albums WHERE id = ?), "
+                "updated_at = ?, row_revision = row_revision + 1 "
+                "WHERE local_album_id = ? AND action = 'artist_identity_reconciliation' "
+                "AND state IN ('pending','running') AND expected_subject_revision = ?",
+                (album_id, now, album_id, previous_revision),
+            )
 
     @staticmethod
     def _retarget_retired_album_references_tx(
@@ -17484,6 +17603,120 @@ class NativeLibraryStore(PersistenceBase):
                     }
                 )
 
+            # Embedded-identity convergence: an unlinked artist credited on this
+            # album whose files all embed one MBID that another active artist
+            # already owns is the same artist under a different (translated or
+            # romanized) tag name. Unlike the name-anchored pass above it covers
+            # album artists too and needs no release identity, because the
+            # user's own MusicBrainz tags are the proof.
+            retired_now = {str(action["source_artist_id"]) for action in actions}
+            credited_rows = connection.execute(
+                "SELECT credit.local_artist_id FROM local_album_artists credit "
+                "WHERE credit.local_album_id = ? "
+                "UNION SELECT credit.local_artist_id FROM local_track_artists credit "
+                "JOIN local_tracks track ON track.id = credit.local_track_id "
+                "WHERE track.local_album_id = ? AND track.availability = 'indexed' "
+                "ORDER BY 1",
+                (local_album_id, local_album_id),
+            ).fetchall()
+            for credited in credited_rows:
+                source_id = str(credited["local_artist_id"])
+                if source_id in retired_now or source_id in {
+                    VARIOUS_ARTISTS_ID,
+                    UNKNOWN_ARTIST_ID,
+                }:
+                    continue
+                source = connection.execute(
+                    "SELECT row_revision FROM local_artists WHERE id = ? "
+                    "AND retired_into_artist_id IS NULL",
+                    (source_id,),
+                ).fetchone()
+                if source is None:
+                    continue
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM local_artist_external_identities "
+                        "WHERE local_artist_id = ? AND provider = 'musicbrainz'",
+                        (source_id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    continue
+                embedded = self._embedded_artist_mbids_tx(connection, source_id)
+                if len(embedded) != 1:
+                    continue
+                artist_mbid = next(iter(embedded))
+                target = connection.execute(
+                    "SELECT artist.id, artist.row_revision "
+                    "FROM local_artist_external_identities identity "
+                    "JOIN local_artists artist ON artist.id = identity.local_artist_id "
+                    "WHERE identity.provider = 'musicbrainz' "
+                    "AND lower(identity.provider_artist_id) = ? "
+                    "AND artist.retired_into_artist_id IS NULL AND artist.id != ?",
+                    (artist_mbid, source_id),
+                ).fetchone()
+                if target is None or str(target["id"]) in {
+                    VARIOUS_ARTISTS_ID,
+                    UNKNOWN_ARTIST_ID,
+                }:
+                    continue
+                if not self._embedded_artist_anchor_tx(
+                    connection, source_id, artist_mbid
+                ):
+                    continue
+                survivor_id = str(target["id"])
+                source_revision = int(source["row_revision"])
+                survivor_revision = int(target["row_revision"])
+                left, right = sorted((source_id, survivor_id))
+                dismissed = connection.execute(
+                    "SELECT 1 FROM library_artist_reconciliation_dismissals "
+                    "WHERE left_artist_id = ? AND right_artist_id = ? "
+                    "AND left_artist_revision = ? AND right_artist_revision = ?",
+                    (
+                        left,
+                        right,
+                        source_revision if left == source_id else survivor_revision,
+                        survivor_revision if right == survivor_id else source_revision,
+                    ),
+                ).fetchone()
+                if dismissed is not None:
+                    continue
+                album_revisions_before = {
+                    str(row["id"]): int(row["row_revision"])
+                    for row in connection.execute(
+                        "SELECT id, row_revision FROM local_albums "
+                        "WHERE album_artist_id = ?",
+                        (source_id,),
+                    ).fetchall()
+                }
+                self._retire_local_artists_tx(
+                    connection,
+                    retired_artist_ids=[source_id],
+                    surviving_artist_id=survivor_id,
+                    now=now,
+                )
+                self._rebaseline_artist_reconciliation_work_tx(
+                    connection, album_revisions_before, now=now
+                )
+                retired_now.add(source_id)
+                actions.append(
+                    {
+                        "source_artist_id": source_id,
+                        "source_artist_revision": source_revision,
+                        "surviving_artist_id": survivor_id,
+                        "surviving_artist_revision": survivor_revision,
+                        "provider_artist_mbid": artist_mbid,
+                        "credits": [
+                            {
+                                "anchor_kind": "embedded_artist_identity",
+                                "embedded_artist_mbid": artist_mbid,
+                            }
+                        ],
+                        "idempotency_prefix": "artist-embedded-anchor",
+                        "reason_code": "AUTOMATIC_EMBEDDED_ARTIST_IDENTITY_CONVERGENCE",
+                    }
+                )
+
             if not actions:
                 return {
                     "retired_artist_ids": [],
@@ -17501,7 +17734,8 @@ class NativeLibraryStore(PersistenceBase):
                     "created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         str(uuid.uuid4()),
-                        f"artist-provider-anchor:{source_id}:{survivor_id}:{artist_mbid}",
+                        f"{action.get('idempotency_prefix', 'artist-provider-anchor')}:"
+                        f"{source_id}:{survivor_id}:{artist_mbid}",
                         None,
                         "merge_artist",
                         survivor_id,
@@ -17529,7 +17763,10 @@ class NativeLibraryStore(PersistenceBase):
                             },
                             sort_keys=True,
                         ),
-                        "AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE",
+                        action.get(
+                            "reason_code",
+                            "AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE",
+                        ),
                         now,
                     ),
                 )
@@ -17635,7 +17872,7 @@ class NativeLibraryStore(PersistenceBase):
                     else None
                 )
                 artist_id = self._provider_artist_for_credit_tx(
-                    connection, credit, now=now
+                    connection, credit, now=now, source_artist_id=source_id
                 )
                 resolved_album.append((credit, artist_id, source_id))
 
@@ -17652,7 +17889,7 @@ class NativeLibraryStore(PersistenceBase):
                         else None
                     )
                     artist_id = self._provider_artist_for_credit_tx(
-                        connection, credit, now=now
+                        connection, credit, now=now, source_artist_id=source_id
                     )
                     resolved.append((credit, artist_id, source_id))
                 resolved_tracks[track.local_track_id] = resolved
@@ -18182,7 +18419,8 @@ class NativeLibraryStore(PersistenceBase):
                     "'$.retired_artist_ids'))), 0) FROM library_catalog_actions "
                     "WHERE reason_code IN ("
                     "'AUTOMATIC_PROVIDER_PROVEN_ARTIST_CONVERGENCE', "
-                    "'AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE')"
+                    "'AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE', "
+                    "'AUTOMATIC_EMBEDDED_ARTIST_IDENTITY_CONVERGENCE')"
                 ).fetchone()[0]
             )
             return {
@@ -18366,7 +18604,8 @@ class NativeLibraryStore(PersistenceBase):
                     "reason_code, created_at FROM library_catalog_actions "
                     "WHERE reason_code IN ("
                     "'AUTOMATIC_PROVIDER_PROVEN_ARTIST_CONVERGENCE', "
-                    "'AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE') "
+                    "'AUTOMATIC_PROVIDER_ANCHORED_ARTIST_CONVERGENCE', "
+                    "'AUTOMATIC_EMBEDDED_ARTIST_IDENTITY_CONVERGENCE') "
                     "ORDER BY created_at DESC, id DESC"
                 ).fetchall()
             ]
