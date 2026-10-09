@@ -53,7 +53,10 @@ from services.native.wal_checkpoint_service import WalCheckpointService
 
 ARTIST_RECONCILIATION_PURPOSE = "artist_identity_reconciliation"
 ARTIST_RECONCILIATION_VERSION = "musicbrainz-artist-credit-v3"
-_BACKFILL_IDEMPOTENCY_KEY = "artist-identity-reconciliation:v3:backfill"
+# v4: one more startup sweep so embedded-MBID convergence heals artists that
+# earlier versions split by tag name. The projection version is unchanged, so
+# albums with unchanged provider evidence still skip the MusicBrainz fetch.
+_BACKFILL_IDEMPOTENCY_KEY = "artist-identity-reconciliation:v4:backfill"
 # Provider-deferred work must not be retried immediately: the defer re-queues the
 # job, and without a not-before the operation worker instantly re-claims the same
 # item and hot-spins against an open circuit breaker. 120 s gives the shared
